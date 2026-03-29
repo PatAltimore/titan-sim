@@ -1,0 +1,1342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Titan Mining Simulator</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a0a00;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: monospace;
+    color: #e0e0e0;
+  }
+  h1 {
+    font-size: 18px;
+    letter-spacing: 4px;
+    color: #f4a832;
+    margin-bottom: 10px;
+    text-transform: uppercase;
+  }
+  #gameCanvas {
+    border: 2px solid #4a2800;
+    display: block;
+    cursor: none;
+  }
+  p.sub {
+    margin-top: 8px;
+    font-size: 10px;
+    color: #5d4037;
+    letter-spacing: 1px;
+  }
+</style>
+</head>
+<body>
+<h1>Titan Mining Simulator</h1>
+<canvas id="gameCanvas" width="900" height="520"></canvas>
+<p class="sub">Saturn's moon Titan — atmosphere 1.48× Earth pressure · gravity 0.14g · hydrocarbon seas · -179°C</p>
+
+<script>
+// ─── Constants ────────────────────────────────────────────────────────────────
+const W = 900, H = 520;
+const WORLD_W = 6000;
+const GRAVITY = 0.14;          // ~0.14g like Titan
+const ATMO_DRAG = 0.86;        // thick N₂ atmosphere damps movement
+const JUMP_FORCE = -5.8;       // floaty low-gravity jump
+const MOVE_ACC = 0.55;
+const MAX_SPEED = 3.8;
+const MINE_TIME = 45;          // frames to mine one batch
+const MINE_AMOUNT = 6;
+const CARGO_MAX = 90;
+const DAMAGE_MAX = 100;
+const HIT_COOLDOWN = 70;   // invincibility frames after a hit
+
+// Resource colors / labels
+const RES = {
+  methane:  { color: '#f4a832', label: 'CH₄',   name: 'Methane',  desc: 'liquid hydrocarbon' },
+  ethane:   { color: '#4fc3f7', label: 'C₂H₆',  name: 'Ethane',   desc: 'liquid hydrocarbon' },
+  ice:      { color: '#b3e5fc', label: 'H₂O',   name: 'Water Ice', desc: 'subsurface deposit' },
+  ammonia:  { color: '#ce93d8', label: 'NH₃',   name: 'Ammonia',  desc: 'volcanic vent' },
+};
+
+// Phase goals (cumulative totals needed in depot)
+const PHASE_GOALS = [
+  null,
+  { methane: 60,  ethane: 25,  ice: 0,   ammonia: 0  },
+  { methane: 120, ethane: 55,  ice: 35,  ammonia: 0  },
+  { methane: 200, ethane: 90,  ice: 70,  ammonia: 20 },
+];
+
+const PHASE_NAMES = [
+  '',
+  'Phase 1: Initial Survey',
+  'Phase 2: Base Expansion',
+  'Phase 3: Full Operations',
+];
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// ─── Game state ───────────────────────────────────────────────────────────────
+let game = {};
+
+function makeGame() {
+  const terrain = buildTerrain();
+  const resources = spawnResources(terrain);
+  const hazards = spawnHazards(terrain);
+  return {
+    phase: 1,
+    state: 'tutorial',  // tutorial | playing | dead | win
+    tutorialPage: 0,
+    cam: { x: 0 },
+    depot: { methane: 0, ethane: 0, ice: 0, ammonia: 0 },
+    terrain,
+    resources,
+    hazards,
+    storm: { active: false, warning: false, timer: 0, next: 500 + rand(300) },
+    rain: [],
+    particles: [],
+    phaseFlash: 0,
+    player: makePlayer(),
+    t: 0,
+  };
+}
+
+function makePlayer() {
+  return {
+    x: 300, y: 100,
+    vx: 0, vy: 0,
+    w: 28, h: 30,
+    onGround: false,
+    facing: 1,
+    cargo: { methane: 0, ethane: 0, ice: 0, ammonia: 0 },
+    cargoTotal: 0,
+    mining: false,
+    mineTimer: 0,
+    mineTarget: null,
+    depositFlash: 0,
+    damage: 0,
+    hitCooldown: 0,
+    repairFlash: 0,
+  };
+}
+
+// ─── Terrain ──────────────────────────────────────────────────────────────────
+function buildTerrain() {
+  const pts = [];
+  let y = 370;
+  for (let x = 0; x <= WORLD_W; x += 50) {
+    if (x < 500) {
+      y = 370; // flat near base
+    } else {
+      y += (Math.random() - 0.49) * 22;
+      y = clamp(y, 270, 410);
+    }
+    pts.push({ x, y });
+  }
+  return pts;
+}
+
+function groundAt(terrain, x) {
+  for (let i = 0; i < terrain.length - 1; i++) {
+    const a = terrain[i], b = terrain[i + 1];
+    if (x >= a.x && x <= b.x) {
+      const t = (x - a.x) / (b.x - a.x);
+      return a.y + t * (b.y - a.y);
+    }
+  }
+  return 370;
+}
+
+// ─── Resources ────────────────────────────────────────────────────────────────
+function spawnResources(terrain) {
+  const out = [];
+  const typePool = [
+    'methane','methane','methane','methane',
+    'ethane','ethane','ethane',
+    'ice','ice',
+    'ammonia',
+  ];
+  for (let i = 0; i < 70; i++) {
+    const x = 600 + Math.random() * (WORLD_W - 900);
+    const type = typePool[Math.floor(Math.random() * typePool.length)];
+    const max = type === 'ammonia' ? 8 + rand(12)
+              : type === 'ice'     ? 12 + rand(18)
+              : 14 + rand(22);
+    out.push({
+      x,
+      y: groundAt(terrain, x) - 18,
+      type, max, amount: max,
+      w: 32, h: 18,
+    });
+  }
+  return out;
+}
+
+// ─── Hazards ──────────────────────────────────────────────────────────────────
+function spawnHazards(terrain) {
+  const out = [];
+  let lastX = 650;
+  while (lastX < WORLD_W - 300) {
+    lastX += 160 + rand(240);
+    const type = ['boulder','boulder','spike','spike','vent'][rand(5)];
+    const gy = groundAt(terrain, lastX);
+    const w = type === 'boulder' ? 24 + rand(22)
+             : type === 'spike'  ? 14 + rand(12)
+             : 20;
+    const h = type === 'boulder' ? 20 + rand(18)
+             : type === 'spike'  ? 26 + rand(22)
+             : 12;
+    out.push({
+      x: lastX, y: gy - h,
+      type, w, h,
+      ventTimer: rand(200),  // stagger vent cycles
+    });
+  }
+  return out;
+}
+
+// ─── Keys ─────────────────────────────────────────────────────────────────────
+const keys = {};
+const keyQueue = [];
+document.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  keyQueue.push(e.code);
+  e.preventDefault();
+}, { passive: false });
+document.addEventListener('keyup',   e => { keys[e.code] = false; });
+
+// ─── Update ───────────────────────────────────────────────────────────────────
+function update(g) {
+  const p = g.player;
+  const st = g.storm;
+  g.t++;
+
+  // ── Storm timing ──
+  st.next--;
+  if (st.next <= 0 && !st.active && !st.warning) {
+    st.warning = true;
+    st.timer = 200;
+  }
+  if (st.warning) {
+    st.timer--;
+    if (st.timer <= 0) {
+      st.warning = false;
+      st.active = true;
+      st.timer = 420;
+      for (let i = 0; i < 220; i++) {
+        g.rain.push({
+          x: Math.random() * WORLD_W,
+          y: Math.random() * -H,
+          spd: 1.4 + Math.random() * 1.2,
+          drift: 0.7 + Math.random() * 0.6,
+          life: 1,
+        });
+      }
+    }
+  }
+  if (st.active) {
+    st.timer--;
+    if (st.timer <= 0) {
+      st.active = false;
+      g.rain = [];
+      st.next = 600 + rand(500);
+    }
+    g.rain.forEach(r => {
+      r.x += r.drift;
+      r.y += r.spd;
+      if (r.y > H + 10) { r.y = -20; r.x = g.cam.x + Math.random() * W; }
+    });
+    // storm pushes player
+    p.vx += 0.25;
+  }
+
+  // ── Player movement ──
+  let mx = 0;
+  if (keys['ArrowLeft']  || keys['KeyA']) { mx = -1; p.facing = -1; }
+  if (keys['ArrowRight'] || keys['KeyD']) { mx =  1; p.facing =  1; }
+
+  p.vx += mx * MOVE_ACC;
+  if (Math.abs(p.vx) > MAX_SPEED) p.vx = Math.sign(p.vx) * MAX_SPEED;
+  p.vx *= ATMO_DRAG;
+
+  if ((keys['ArrowUp'] || keys['KeyW'] || keys['Space']) && p.onGround) {
+    p.vy = JUMP_FORCE;
+    p.onGround = false;
+  }
+
+  p.vy += GRAVITY;
+  p.x += p.vx;
+  p.y += p.vy;
+
+  p.x = clamp(p.x, 60, WORLD_W - 60);
+
+  // ground collision
+  const gy = groundAt(g.terrain, p.x + p.w / 2);
+  if (p.y + p.h >= gy) {
+    p.y = gy - p.h;
+    p.vy = 0;
+    p.onGround = true;
+  } else {
+    p.onGround = false;
+  }
+
+  // ── Camera ──
+  g.cam.x = clamp(p.x - W / 2, 0, WORLD_W - W);
+
+  // ── Mining ──
+  p.mining = false;
+  p.mineTarget = null;
+  const wantMine = keys['KeyZ'] || keys['ArrowDown'] || keys['KeyX'];
+
+  if (wantMine) {
+    let best = null, bestDist = 65;
+    g.resources.forEach(r => {
+      if (r.amount <= 0) return;
+      const dx = r.x - (p.x + p.w / 2);
+      const dy = r.y + r.h / 2 - (p.y + p.h / 2);
+      const d = Math.sqrt(dx * dx + dy * dy);
+      if (d < bestDist) { bestDist = d; best = r; }
+    });
+
+    if (best) {
+      p.mining = true;
+      p.mineTarget = best;
+      p.mineTimer++;
+      if (p.mineTimer >= MINE_TIME) {
+        p.mineTimer = 0;
+        const space = CARGO_MAX - p.cargoTotal;
+        if (space > 0 && best.amount > 0) {
+          const take = Math.min(MINE_AMOUNT, space, best.amount);
+          p.cargo[best.type] += take;
+          best.amount -= take;
+          p.cargoTotal = cargoSum(p.cargo);
+          // spawn particle
+          for (let i = 0; i < 5; i++) {
+            g.particles.push({
+              x: best.x, y: best.y,
+              vx: (Math.random() - 0.5) * 3,
+              vy: -Math.random() * 2.5,
+              life: 30,
+              color: RES[best.type].color,
+              r: 2 + Math.random() * 3,
+            });
+          }
+        }
+      }
+    } else {
+      p.mineTimer = 0;
+    }
+  } else {
+    p.mineTimer = 0;
+  }
+
+  // ── Hazard updates + collision ──
+  if (p.hitCooldown > 0) p.hitCooldown--;
+  const stormMult = g.storm.active ? 2 : 1;
+
+  g.hazards.forEach(h => {
+    if (h.type === 'vent') h.ventTimer = (h.ventTimer + 1) % 220;
+    const ventActive = h.type === 'vent' && h.ventTimer < 80;
+
+    let hit = false;
+    if (ventActive) {
+      // plume danger zone: above vent opening, 22px wide, 68px tall
+      const pcx = p.x + p.w / 2, pcy = p.y + p.h / 2;
+      if (Math.abs(pcx - h.x) < 16 && pcy > h.y - 68 && pcy < h.y + 4) hit = true;
+    } else if (h.type !== 'vent') {
+      // AABB for boulders and spikes
+      if (p.x < h.x + h.w && p.x + p.w > h.x && p.y < h.y + h.h && p.y + p.h > h.y) hit = true;
+    }
+
+    if (hit && p.hitCooldown <= 0) {
+      const dmg = (h.type === 'vent' ? 7 : 12) * stormMult;
+      p.damage = clamp(p.damage + dmg, 0, DAMAGE_MAX);
+      p.hitCooldown = HIT_COOLDOWN;
+      for (let i = 0; i < 7; i++) {
+        g.particles.push({
+          x: p.x + p.w / 2, y: p.y + p.h / 2,
+          vx: (Math.random() - 0.5) * 5,
+          vy: -1 - Math.random() * 3,
+          life: 28, color: '#ff5252', r: 2 + Math.random() * 2.5,
+        });
+      }
+      if (p.damage >= DAMAGE_MAX) g.state = 'dead';
+    }
+  });
+
+  // ── Deposit at base ──
+  const baseRight = 230, baseLeft = 120;
+  const baseGy = groundAt(g.terrain, 175) - 62;
+  if (p.x + p.w > baseLeft && p.x < baseRight && p.y > baseGy - 10) {
+    if (p.cargoTotal > 0) {
+      Object.keys(p.cargo).forEach(k => { g.depot[k] += p.cargo[k]; p.cargo[k] = 0; });
+      p.cargoTotal = 0;
+      p.depositFlash = 60;
+    }
+    // Repair rover at base
+    if (p.damage > 0) {
+      p.damage = clamp(p.damage - 1.2, 0, DAMAGE_MAX);
+      p.repairFlash = 20;
+    }
+  }
+  if (p.depositFlash > 0) p.depositFlash--;
+  if (p.repairFlash > 0) p.repairFlash--;
+
+  // ── Particles ──
+  g.particles = g.particles.filter(pt => {
+    pt.x += pt.vx;
+    pt.y += pt.vy;
+    pt.vy += 0.05;
+    pt.life--;
+    return pt.life > 0;
+  });
+
+  // ── Phase progression ──
+  if (g.phaseFlash > 0) g.phaseFlash--;
+  const goal = PHASE_GOALS[g.phase];
+  if (goal) {
+    const done = Object.keys(goal).every(k => g.depot[k] >= goal[k]);
+    if (done) {
+      if (g.phase < 3) {
+        g.phase++;
+        g.phaseFlash = 180;
+      } else {
+        g.state = 'win';
+      }
+    }
+  }
+}
+
+// ─── Draw helpers ─────────────────────────────────────────────────────────────
+function panel(x, y, w, h, alpha = 0.68) {
+  ctx.fillStyle = `rgba(10,5,0,${alpha})`;
+  ctx.beginPath();
+  ctx.roundRect(x, y, w, h, 7);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(200,120,20,0.3)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+}
+
+function bar(x, y, w, h, ratio, color, bg = 'rgba(255,255,255,0.12)') {
+  ctx.fillStyle = bg;
+  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = color;
+  ctx.fillRect(x, y, w * clamp(ratio, 0, 1), h);
+}
+
+// ─── Draw ─────────────────────────────────────────────────────────────────────
+function draw(g) {
+  const cam = g.cam.x;
+
+  // ── Sky ──
+  const skyAlpha = g.storm.active ? 0.55 : 0;
+  const skyGrad = ctx.createLinearGradient(0, 0, 0, H * 0.72);
+  if (g.storm.active) {
+    skyGrad.addColorStop(0, '#3d1400');
+    skyGrad.addColorStop(0.6, '#6b2800');
+    skyGrad.addColorStop(1, '#8b4e08');
+  } else {
+    skyGrad.addColorStop(0, '#2a0d00');
+    skyGrad.addColorStop(0.5, '#5a2800');
+    skyGrad.addColorStop(1, '#8b5e0a');
+  }
+  ctx.fillStyle = skyGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  // haze bands
+  for (let i = 0; i < 4; i++) {
+    ctx.fillStyle = `rgba(200,100,15,${0.04 + i * 0.02})`;
+    ctx.fillRect(0, i * 30, W, 30);
+  }
+
+  // Saturn (parallax)
+  const sx = 680 - cam * 0.008;
+  ctx.save();
+  ctx.globalAlpha = 0.22;
+  const satGrad = ctx.createRadialGradient(sx, 58, 0, sx, 58, 50);
+  satGrad.addColorStop(0, '#f0d878');
+  satGrad.addColorStop(1, '#c8a030');
+  ctx.fillStyle = satGrad;
+  ctx.beginPath();
+  ctx.ellipse(sx, 58, 50, 36, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // rings
+  ctx.strokeStyle = '#d4a740';
+  ctx.lineWidth = 5;
+  ctx.globalAlpha = 0.18;
+  ctx.beginPath();
+  ctx.ellipse(sx, 58, 88, 18, -0.18, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.lineWidth = 3;
+  ctx.globalAlpha = 0.12;
+  ctx.beginPath();
+  ctx.ellipse(sx, 58, 105, 22, -0.18, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+
+  // background hills (parallax)
+  ctx.fillStyle = 'rgba(90,45,5,0.35)';
+  const hillSeeds = [0, 250, 500, 750, 1000, 1250, 1500, 1750, 2000];
+  hillSeeds.forEach((s, i) => {
+    const hx = ((s - cam * 0.06) % (W + 200)) - 100;
+    const hh = 35 + ((i * 37) % 40);
+    ctx.beginPath();
+    ctx.moveTo(hx - 90, 265);
+    ctx.quadraticCurveTo(hx, 265 - hh, hx + 90, 265);
+    ctx.fill();
+  });
+
+  // ── Terrain ──
+  const ter = g.terrain;
+  ctx.beginPath();
+  ctx.moveTo(ter[0].x - cam, ter[0].y);
+  for (let i = 1; i < ter.length; i++) ctx.lineTo(ter[i].x - cam, ter[i].y);
+  ctx.lineTo(ter[ter.length - 1].x - cam, H + 10);
+  ctx.lineTo(ter[0].x - cam, H + 10);
+  ctx.closePath();
+
+  const gndGrad = ctx.createLinearGradient(0, 260, 0, H);
+  gndGrad.addColorStop(0, '#7a5810');
+  gndGrad.addColorStop(0.3, '#5c3e0a');
+  gndGrad.addColorStop(1, '#2e1c04');
+  ctx.fillStyle = gndGrad;
+  ctx.fill();
+
+  // surface edge
+  ctx.beginPath();
+  ctx.moveTo(ter[0].x - cam, ter[0].y);
+  for (let i = 1; i < ter.length; i++) ctx.lineTo(ter[i].x - cam, ter[i].y);
+  ctx.strokeStyle = '#c8920a';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // ── Base ──
+  const bgy = groundAt(ter, 175);
+  const by  = bgy - 62;
+  const bx  = 120 - cam;
+  // landing pad
+  ctx.fillStyle = '#37474f';
+  ctx.fillRect(bx, bgy - 4, 110, 4);
+  // struts
+  ctx.strokeStyle = '#546e7a';
+  ctx.lineWidth = 3;
+  [[bx + 15, by + 60], [bx + 95, by + 60]].forEach(([sx2, sy2]) => {
+    ctx.beginPath();
+    ctx.moveTo(bx + 55, by + 30);
+    ctx.lineTo(sx2, sy2);
+    ctx.stroke();
+  });
+  // body
+  const bodyGrad = ctx.createLinearGradient(bx + 10, by, bx + 100, by);
+  bodyGrad.addColorStop(0, '#455a64');
+  bodyGrad.addColorStop(1, '#607d8b');
+  ctx.fillStyle = bodyGrad;
+  ctx.beginPath();
+  ctx.roundRect(bx + 10, by + 10, 90, 52, 4);
+  ctx.fill();
+  // dome
+  ctx.fillStyle = '#78909c';
+  ctx.beginPath();
+  ctx.arc(bx + 55, by + 10, 28, Math.PI, 0);
+  ctx.fill();
+  ctx.fillStyle = '#4dd0e1';
+  ctx.beginPath();
+  ctx.arc(bx + 55, by + 10, 18, Math.PI, 0);
+  ctx.fill();
+  // window shine
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.beginPath();
+  ctx.arc(bx + 47, by + 5, 5, Math.PI, 0);
+  ctx.fill();
+  // door
+  ctx.fillStyle = '#263238';
+  ctx.beginPath();
+  ctx.roundRect(bx + 45, by + 32, 20, 30, 3);
+  ctx.fill();
+  // label
+  ctx.fillStyle = '#80cbc4';
+  ctx.font = 'bold 9px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('BASE CAMP', bx + 55, by + 24);
+  // deposit flash
+  if (g.player.depositFlash > 0) {
+    const a = g.player.depositFlash / 60;
+    ctx.fillStyle = `rgba(105,240,174,${a * 0.4})`;
+    ctx.beginPath();
+    ctx.roundRect(bx, by - 5, 110, 70, 6);
+    ctx.fill();
+    ctx.font = 'bold 11px monospace';
+    ctx.fillStyle = `rgba(105,240,174,${a})`;
+    ctx.fillText('DEPOSITED!', bx + 55, by - 10);
+  }
+
+  // ── Hazards ──
+  drawHazards(g);
+
+  // ── Resources ──
+  g.resources.forEach(r => {
+    if (r.amount <= 0) return;
+    const rx = r.x - cam;
+    if (rx < -60 || rx > W + 60) return;
+    const ry = r.y;
+    const ratio = r.amount / r.max;
+    const col = RES[r.type].color;
+
+    ctx.save();
+    if (r.type === 'methane' || r.type === 'ethane') {
+      // shimmering pool
+      const pw = (20 + ratio * 20) * ratio;
+      ctx.beginPath();
+      ctx.ellipse(rx, ry + 8, pw, 7, 0, 0, Math.PI * 2);
+      ctx.fillStyle = col;
+      ctx.globalAlpha = 0.75;
+      ctx.fill();
+      // shimmer highlight
+      ctx.beginPath();
+      ctx.ellipse(rx - pw * 0.3, ry + 5, pw * 0.25, 2.5, -0.2, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255,255,255,0.45)';
+      ctx.fill();
+    } else if (r.type === 'ice') {
+      // crystals
+      ctx.fillStyle = col;
+      ctx.globalAlpha = 0.85;
+      const crystalH = [10, 16, 12];
+      for (let i = 0; i < 3; i++) {
+        const cx = rx + (i - 1) * 11;
+        const ch = crystalH[i] * ratio;
+        ctx.beginPath();
+        ctx.moveTo(cx, ry - ch);
+        ctx.lineTo(cx - 5, ry + 2);
+        ctx.lineTo(cx + 5, ry + 2);
+        ctx.closePath();
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+    } else if (r.type === 'ammonia') {
+      // vent crack
+      ctx.fillStyle = '#5d3060';
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      ctx.roundRect(rx - 9, ry + 2, 18, 10, 2);
+      ctx.fill();
+      // gas puffs
+      for (let i = 0; i < 4; i++) {
+        const pulsed = 0.3 + 0.2 * Math.sin(g.t * 0.1 + i * 1.5);
+        ctx.beginPath();
+        ctx.arc(rx + (i - 1.5) * 5, ry - 4 - i * 5, 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = col;
+        ctx.globalAlpha = pulsed * ratio;
+        ctx.fill();
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // label above
+    ctx.font = '8px monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.textAlign = 'center';
+    ctx.fillText(RES[r.type].label, rx, ry - 10);
+
+    // highlight if in range
+    if (g.player.mineTarget === r) {
+      ctx.strokeStyle = '#ffeb3b';
+      ctx.lineWidth = 2;
+      ctx.globalAlpha = 0.7 + 0.3 * Math.sin(g.t * 0.2);
+      ctx.beginPath();
+      ctx.roundRect(rx - 22, ry - 14, 44, 28, 4);
+      ctx.stroke();
+    }
+    ctx.restore();
+  });
+
+  // ── Particles ──
+  g.particles.forEach(pt => {
+    ctx.globalAlpha = pt.life / 30;
+    ctx.fillStyle = pt.color;
+    ctx.beginPath();
+    ctx.arc(pt.x - cam, pt.y, pt.r, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+
+  // ── Player ──
+  drawPlayer(g);
+
+  // ── Rain ──
+  if (g.storm.active) {
+    ctx.strokeStyle = '#4fc3f7';
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.45;
+    g.rain.forEach(r => {
+      const rx = r.x - cam;
+      if (rx < 0 || rx > W) return;
+      ctx.beginPath();
+      ctx.moveTo(rx, r.y);
+      ctx.lineTo(rx + r.drift * 4, r.y + r.spd * 5);
+      ctx.stroke();
+    });
+    ctx.globalAlpha = 1;
+    // orange tint
+    ctx.fillStyle = 'rgba(200,80,0,0.07)';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // ── HUD ──
+  drawHUD(g);
+
+  // ── Storm warning overlay ──
+  if (g.storm.warning) {
+    const a = 0.25 + 0.2 * Math.sin(g.t * 0.15);
+    ctx.fillStyle = `rgba(255,100,0,${a})`;
+    ctx.fillRect(0, 0, W, H);
+    ctx.font = 'bold 24px monospace';
+    ctx.fillStyle = '#ff6d00';
+    ctx.textAlign = 'center';
+    ctx.fillText('⚠  METHANE STORM INCOMING  ⚠', W / 2, H / 2);
+    ctx.font = '13px monospace';
+    ctx.fillStyle = '#ffb74d';
+    ctx.fillText('Slow-falling methane rain will push your rover', W / 2, H / 2 + 28);
+  }
+
+  // ── Phase flash ──
+  if (g.phaseFlash > 0 && g.state !== 'win') {
+    const a = Math.min(1, g.phaseFlash / 60);
+    ctx.fillStyle = `rgba(105,240,174,${a * 0.15})`;
+    ctx.fillRect(0, 0, W, H);
+    ctx.font = 'bold 22px monospace';
+    ctx.fillStyle = `rgba(105,240,174,${a})`;
+    ctx.textAlign = 'center';
+    ctx.fillText(`✓ ${PHASE_NAMES[g.phase - 1]} COMPLETE`, W / 2, H / 2 - 10);
+    ctx.font = '14px monospace';
+    ctx.fillStyle = `rgba(200,220,255,${a})`;
+    ctx.fillText(`Starting ${PHASE_NAMES[g.phase]}`, W / 2, H / 2 + 16);
+  }
+
+  // ── Tutorial ──
+  if (g.state === 'tutorial') drawTutorial(g);
+
+  // ── Dead screen ──
+  if (g.state === 'dead') {
+    ctx.fillStyle = 'rgba(80,0,0,0.82)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 30px monospace';
+    ctx.fillStyle = '#ff5252';
+    ctx.fillText('ROVER DESTROYED', W / 2, H / 2 - 50);
+    ctx.font = '14px monospace';
+    ctx.fillStyle = '#ef9a9a';
+    ctx.fillText('Hull integrity reached 0% — too much damage.', W / 2, H / 2 - 10);
+    ctx.fillStyle = '#b0bec5';
+    ctx.font = '12px monospace';
+    ctx.fillText('Tip: jump over boulders & ice spikes.', W / 2, H / 2 + 18);
+    ctx.fillText('Avoid cryo-vent gas plumes.', W / 2, H / 2 + 36);
+    ctx.fillText('Return to BASE to repair hull.', W / 2, H / 2 + 54);
+    ctx.fillText('During methane storms, hazards deal 2× damage.', W / 2, H / 2 + 72);
+    ctx.font = 'bold 13px monospace';
+    ctx.fillStyle = '#f4a832';
+    ctx.fillText('Press R to try again', W / 2, H / 2 + 105);
+  }
+
+  // ── Win screen ──
+  if (g.state === 'win') {
+    ctx.fillStyle = 'rgba(0,0,0,0.75)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 32px monospace';
+    ctx.fillStyle = '#69f0ae';
+    ctx.fillText('MISSION COMPLETE', W / 2, H / 2 - 60);
+    ctx.font = '16px monospace';
+    ctx.fillStyle = '#e0e0e0';
+    ctx.fillText('All phases done. Titan Base is fully operational!', W / 2, H / 2 - 20);
+    ctx.font = '13px monospace';
+    ctx.fillStyle = '#90a4ae';
+    const stats = [
+      `Methane collected: ${g.depot.methane} units`,
+      `Ethane collected:  ${g.depot.ethane} units`,
+      `Water ice:         ${g.depot.ice} units`,
+      `Ammonia:           ${g.depot.ammonia} units`,
+    ];
+    stats.forEach((s, i) => {
+      ctx.fillText(s, W / 2, H / 2 + 15 + i * 20);
+    });
+    ctx.font = 'bold 13px monospace';
+    ctx.fillStyle = '#f4a832';
+    ctx.fillText('Press R to play again', W / 2, H / 2 + 110);
+  }
+}
+
+function drawHazards(g) {
+  const cam = g.cam.x;
+  g.hazards.forEach(h => {
+    const hx = h.x - cam;
+    if (hx < -80 || hx > W + 80) return;
+    const ventActive = h.type === 'vent' && h.ventTimer < 80;
+
+    ctx.save();
+    if (h.type === 'boulder') {
+      // Shadow
+      ctx.fillStyle = 'rgba(0,0,0,0.3)';
+      ctx.beginPath();
+      ctx.ellipse(hx + h.w / 2, h.y + h.h + 3, h.w / 2, 5, 0, 0, Math.PI * 2);
+      ctx.fill();
+      // Rock body
+      const rockGrad = ctx.createRadialGradient(hx + h.w * 0.35, h.y + h.h * 0.35, 1, hx + h.w / 2, h.y + h.h / 2, h.w / 2);
+      rockGrad.addColorStop(0, '#6b5030');
+      rockGrad.addColorStop(1, '#2e1a08');
+      ctx.fillStyle = rockGrad;
+      ctx.beginPath();
+      ctx.ellipse(hx + h.w / 2, h.y + h.h / 2, h.w / 2, h.h / 2, 0.15, 0, Math.PI * 2);
+      ctx.fill();
+      // Surface crack
+      ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(hx + h.w * 0.4, h.y + h.h * 0.2);
+      ctx.lineTo(hx + h.w * 0.55, h.y + h.h * 0.55);
+      ctx.lineTo(hx + h.w * 0.45, h.y + h.h * 0.8);
+      ctx.stroke();
+      // Glint
+      ctx.fillStyle = 'rgba(255,210,130,0.18)';
+      ctx.beginPath();
+      ctx.ellipse(hx + h.w * 0.35, h.y + h.h * 0.32, h.w * 0.18, h.h * 0.14, -0.4, 0, Math.PI * 2);
+      ctx.fill();
+
+    } else if (h.type === 'spike') {
+      // Two ice spikes side by side
+      const spikeData = [
+        { ox: 0,        sh: h.h },
+        { ox: h.w * 0.5, sh: h.h * 0.72 },
+      ];
+      spikeData.forEach(s => {
+        const sx = hx + s.ox;
+        const sy = h.y + h.h - s.sh;
+        const sw = h.w * 0.48;
+        ctx.fillStyle = '#78b8d8';
+        ctx.beginPath();
+        ctx.moveTo(sx + sw / 2, sy);
+        ctx.lineTo(sx, sy + s.sh);
+        ctx.lineTo(sx + sw, sy + s.sh);
+        ctx.closePath();
+        ctx.fill();
+        // Shine
+        ctx.strokeStyle = 'rgba(200,240,255,0.7)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(sx + sw * 0.35, sy + s.sh * 0.15);
+        ctx.lineTo(sx + sw * 0.2, sy + s.sh * 0.6);
+        ctx.stroke();
+      });
+
+    } else if (h.type === 'vent') {
+      // Base crack
+      ctx.fillStyle = '#2a1040';
+      ctx.beginPath();
+      ctx.roundRect(hx - 9, h.y, 18, h.h, 2);
+      ctx.fill();
+      ctx.strokeStyle = ventActive ? '#b39ddb' : '#7e57c2';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.ellipse(hx, h.y, 9, 4, 0, 0, Math.PI * 2);
+      ctx.stroke();
+
+      if (ventActive) {
+        // Gas plume (animated)
+        const wobble = Math.sin(g.t * 0.18) * 6;
+        const plumeH = 65;
+        const grad = ctx.createLinearGradient(hx, h.y, hx, h.y - plumeH);
+        grad.addColorStop(0, 'rgba(179,136,255,0.75)');
+        grad.addColorStop(0.6, 'rgba(149,106,225,0.4)');
+        grad.addColorStop(1, 'rgba(149,106,225,0)');
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.moveTo(hx - 11, h.y);
+        ctx.bezierCurveTo(hx - 8 + wobble, h.y - 22, hx + 6, h.y - 44, hx + wobble * 0.6, h.y - plumeH);
+        ctx.bezierCurveTo(hx - 6 - wobble * 0.6, h.y - 44, hx + 8, h.y - 22, hx + 11, h.y);
+        ctx.fill();
+        // Danger pulse
+        const da = 0.5 + 0.4 * Math.sin(g.t * 0.25);
+        ctx.font = '11px monospace';
+        ctx.fillStyle = `rgba(255,82,82,${da})`;
+        ctx.textAlign = 'center';
+        ctx.fillText('☢', hx, h.y - 72);
+      } else {
+        // Dormant indicator
+        ctx.font = '9px monospace';
+        ctx.fillStyle = 'rgba(126,87,194,0.55)';
+        ctx.textAlign = 'center';
+        ctx.fillText('vent', hx, h.y - 8);
+      }
+    }
+    ctx.restore();
+  });
+}
+
+function drawPlayer(g) {
+  const p = g.player;
+  const px = p.x - g.cam.x;
+  const py = p.y;
+
+  ctx.save();
+  ctx.translate(px + p.w / 2, py + p.h / 2);
+  if (p.facing < 0) ctx.scale(-1, 1);
+
+  // treads
+  ctx.fillStyle = '#546e7a';
+  ctx.beginPath();
+  ctx.roundRect(-14, 6, 28, 9, 4);
+  ctx.fill();
+  for (let i = -10; i <= 10; i += 6) {
+    ctx.fillStyle = '#37474f';
+    ctx.fillRect(i, 7, 3, 7);
+  }
+
+  // body
+  ctx.fillStyle = '#eceff1';
+  ctx.beginPath();
+  ctx.roundRect(-11, -14, 22, 21, 3);
+  ctx.fill();
+  // body detail
+  ctx.fillStyle = '#b0bec5';
+  ctx.fillRect(-9, -5, 18, 3);
+
+  // visor
+  ctx.fillStyle = '#0097a7';
+  ctx.beginPath();
+  ctx.roundRect(-8, -12, 16, 7, 2);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  ctx.fillRect(-7, -11, 5, 3);
+
+  // antenna
+  ctx.strokeStyle = '#90a4ae';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(7, -14);
+  ctx.lineTo(7, -23);
+  ctx.stroke();
+  const blinkOn = Math.floor(g.t / 20) % 2 === 0;
+  ctx.fillStyle = blinkOn ? '#ff1744' : '#b71c1c';
+  ctx.beginPath();
+  ctx.arc(7, -23, 2.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  // drill arm
+  if (p.mining) {
+    ctx.strokeStyle = '#ffb74d';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(11, 1);
+    ctx.lineTo(20, 6);
+    ctx.stroke();
+    ctx.fillStyle = '#ff8f00';
+    ctx.beginPath();
+    ctx.moveTo(20, 6);
+    ctx.lineTo(25, 3);
+    ctx.lineTo(25, 9);
+    ctx.closePath();
+    ctx.fill();
+    // sparks
+    if (p.mineTimer % 8 < 4) {
+      ctx.fillStyle = '#ffeb3b';
+      ctx.beginPath();
+      ctx.arc(22 + rand(4) - 2, 6 + rand(4) - 2, 1.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  } else {
+    ctx.fillStyle = '#78909c';
+    ctx.fillRect(10, -1, 10, 6);
+  }
+
+  // Hit flash overlay on rover
+  if (p.hitCooldown > HIT_COOLDOWN - 15) {
+    ctx.save();
+    ctx.globalAlpha = (p.hitCooldown - (HIT_COOLDOWN - 15)) / 15 * 0.55;
+    ctx.fillStyle = '#ff1744';
+    ctx.beginPath();
+    ctx.roundRect(px, py, p.w, p.h, 4);
+    ctx.fill();
+    ctx.restore();
+  }
+  // Repair flash (green)
+  if (p.repairFlash > 0) {
+    ctx.save();
+    ctx.globalAlpha = p.repairFlash / 20 * 0.4;
+    ctx.fillStyle = '#69f0ae';
+    ctx.beginPath();
+    ctx.roundRect(px, py, p.w, p.h, 4);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  ctx.restore();
+
+  // cargo bar
+  if (p.cargoTotal > 0) {
+    const bw = 34, bx2 = px + p.w / 2 - bw / 2;
+    bar(bx2, py - 10, bw, 5, p.cargoTotal / CARGO_MAX,
+        p.cargoTotal > CARGO_MAX * 0.8 ? '#ff5252' : '#69f0ae');
+  }
+  // mine progress bar
+  if (p.mining && p.mineTimer > 0) {
+    const bw = 34, bx2 = px + p.w / 2 - bw / 2;
+    bar(bx2, py - 18, bw, 4, p.mineTimer / MINE_TIME, '#ffb74d');
+  }
+}
+
+function drawHUD(g) {
+  // ── Mission goals — left ──
+  const goal = PHASE_GOALS[g.phase];
+  const rows = Object.keys(goal).filter(k => goal[k] > 0);
+  const panH = 26 + rows.length * 22 + 10;
+  panel(10, 10, 210, panH);
+
+  ctx.font = 'bold 11px monospace';
+  ctx.fillStyle = '#f4a832';
+  ctx.textAlign = 'left';
+  ctx.fillText(PHASE_NAMES[g.phase], 20, 26);
+
+  rows.forEach((type, i) => {
+    const y = 44 + i * 22;
+    const collected = Math.min(g.depot[type], goal[type]);
+    const needed = goal[type];
+    const done = collected >= needed;
+    const col = done ? '#69f0ae' : RES[type].color;
+
+    ctx.font = '10px monospace';
+    ctx.fillStyle = col;
+    ctx.textAlign = 'left';
+    ctx.fillText(RES[type].label, 20, y);
+    ctx.fillStyle = done ? '#69f0ae' : '#ccc';
+    ctx.fillText(`${collected}/${needed}`, 58, y);
+
+    bar(105, y - 9, 100, 7, collected / needed, col);
+    if (done) {
+      ctx.fillStyle = '#69f0ae';
+      ctx.font = '9px monospace';
+      ctx.fillText('✓', 210, y);
+    }
+  });
+
+  // ── Cargo + Hull — right ──
+  const cargoRows = Object.keys(g.player.cargo).filter(k => g.player.cargo[k] > 0);
+  const cpanH = 26 + Math.max(cargoRows.length, 1) * 16 + 40;
+  panel(W - 175, 10, 165, cpanH);
+
+  ctx.font = 'bold 11px monospace';
+  ctx.fillStyle = '#b0bec5';
+  ctx.textAlign = 'left';
+  ctx.fillText('ROVER CARGO', W - 165, 26);
+
+  if (cargoRows.length === 0) {
+    ctx.font = '10px monospace';
+    ctx.fillStyle = '#546e7a';
+    ctx.fillText('empty', W - 165, 46);
+  } else {
+    cargoRows.forEach((type, i) => {
+      const y = 44 + i * 16;
+      ctx.font = '10px monospace';
+      ctx.fillStyle = RES[type].color;
+      ctx.fillText(`${RES[type].label}: ${g.player.cargo[type]}`, W - 165, y);
+    });
+  }
+
+  // cargo total bar
+  const cy2 = cpanH - 32;
+  ctx.font = '9px monospace';
+  ctx.fillStyle = '#546e7a';
+  ctx.fillText(`${g.player.cargoTotal}/${CARGO_MAX}`, W - 165, cy2 + 12);
+  bar(W - 115, cy2 + 3, 100, 5, g.player.cargoTotal / CARGO_MAX,
+      g.player.cargoTotal > CARGO_MAX * 0.8 ? '#ff5252' : '#4db6ac');
+
+  // hull integrity bar
+  const dmgRatio = g.player.damage / DAMAGE_MAX;
+  const hullColor = dmgRatio > 0.7 ? '#ff1744' : dmgRatio > 0.4 ? '#ff9800' : '#69f0ae';
+  const hullY = cy2 + 20;
+  ctx.font = '9px monospace';
+  ctx.fillStyle = dmgRatio > 0.4 ? hullColor : '#546e7a';
+  ctx.fillText(`hull ${Math.round(100 - g.player.damage)}%`, W - 165, hullY + 12);
+  bar(W - 115, hullY + 3, 100, 5, 1 - dmgRatio, hullColor);
+  if (g.storm.active && g.player.damage > 0) {
+    ctx.font = '8px monospace';
+    ctx.fillStyle = '#ff7043';
+    ctx.fillText('storm x2 dmg', W - 115, hullY + 22);
+  }
+
+  // ── Hints panel — bottom-left ──
+  const hpx = 10, hpy = H - 148, hpw = 224, hph = 138;
+  panel(hpx, hpy, hpw, hph);
+
+  // Title
+  ctx.font = 'bold 10px monospace';
+  ctx.fillStyle = '#f4a832';
+  ctx.textAlign = 'left';
+  ctx.fillText('HOW TO PLAY', hpx + 12, hpy + 16);
+
+  // Divider
+  ctx.strokeStyle = 'rgba(244,168,50,0.2)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(hpx + 8, hpy + 22);
+  ctx.lineTo(hpx + hpw - 8, hpy + 22);
+  ctx.stroke();
+
+  // Key bindings
+  const hints = [
+    { key: '← →  /  A D',    desc: 'Move rover' },
+    { key: '↑ / W / Space',  desc: 'Jump  (0.14g — float!)' },
+    { key: 'Z / X / ↓',      desc: 'Mine  (hold near deposit)' },
+    { key: 'Walk to BASE',    desc: 'Deposit cargo' },
+  ];
+  hints.forEach((h, i) => {
+    const hy = hpy + 34 + i * 20;
+    ctx.font = 'bold 9px monospace';
+    ctx.fillStyle = '#f4a832';
+    ctx.fillText(h.key, hpx + 12, hy);
+    ctx.font = '9px monospace';
+    ctx.fillStyle = '#8d7050';
+    ctx.fillText(h.desc, hpx + 115, hy);
+  });
+
+  // Divider
+  ctx.strokeStyle = 'rgba(244,168,50,0.15)';
+  ctx.beginPath();
+  ctx.moveTo(hpx + 8, hpy + 118);
+  ctx.lineTo(hpx + hpw - 8, hpy + 118);
+  ctx.stroke();
+
+  // Context-sensitive tip
+  let tip = '▶ Explore right to find resources';
+  let tipColor = '#607060';
+  if (g.player.damage >= DAMAGE_MAX * 0.75) {
+    tip = '⚠ Hull critical — return to BASE!';
+    tipColor = '#ff1744';
+  } else if (g.storm.warning) {
+    tip = '⚠ Storm incoming — hazards hit harder!';
+    tipColor = '#ff8f00';
+  } else if (g.storm.active) {
+    tip = '⛈ Storm: hazards deal 2× damage!';
+    tipColor = '#ff7043';
+  } else if (g.player.cargoTotal >= CARGO_MAX * 0.8) {
+    tip = '◀ Cargo full — return to BASE!';
+    tipColor = '#ff5252';
+  } else if (g.player.damage > 0 && g.player.damage < DAMAGE_MAX * 0.4) {
+    tip = '◀ BASE repairs your hull';
+    tipColor = '#69f0ae';
+  } else if (g.player.mineTarget) {
+    tip = '⛏ Hold Z / X to mine this deposit';
+    tipColor = '#ffb74d';
+  }
+  ctx.font = '9px monospace';
+  ctx.fillStyle = tipColor;
+  ctx.fillText(tip, hpx + 12, hpy + 131);
+
+  // ── Storm active tag — bottom-center ──
+  if (g.storm.active) {
+    panel(W / 2 - 100, H - 28, 200, 22, 0.8);
+    ctx.font = 'bold 11px monospace';
+    ctx.fillStyle = '#ff7043';
+    ctx.textAlign = 'center';
+    ctx.fillText('⛈  METHANE STORM ACTIVE', W / 2, H - 13);
+  }
+}
+
+// ─── Tutorial ─────────────────────────────────────────────────────────────────
+const TUTORIAL_PAGES = [
+  {
+    title: 'MISSION BRIEFING',
+    icon: '🛸',
+    lines: [
+      "You are a mining drone deployed on TITAN,",
+      "Saturn's largest moon.",
+      "",
+      "Titan has a thick nitrogen atmosphere,",
+      "liquid methane seas, water-ice crust,",
+      "and gravity just 14% of Earth's.",
+      "",
+      "Your mission: mine resources across",
+      "3 phases to make the base fully operational.",
+      "",
+      "Complete all phase quotas to win!",
+    ],
+  },
+  {
+    title: 'CONTROLS',
+    icon: '🎮',
+    lines: null, // rendered specially
+  },
+  {
+    title: 'RESOURCES',
+    icon: '⛏',
+    lines: null, // rendered specially
+  },
+];
+
+function drawTutorial(g) {
+  // Dim the world behind
+  ctx.fillStyle = 'rgba(5,2,0,0.78)';
+  ctx.fillRect(0, 0, W, H);
+
+  const page = TUTORIAL_PAGES[g.tutorialPage];
+  const total = TUTORIAL_PAGES.length;
+  const px = W / 2 - 310, py = 40, pw = 620, ph = 420;
+
+  // Panel
+  ctx.fillStyle = 'rgba(15,7,0,0.95)';
+  ctx.beginPath();
+  ctx.roundRect(px, py, pw, ph, 12);
+  ctx.fill();
+  ctx.strokeStyle = '#f4a832';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Title bar
+  ctx.fillStyle = 'rgba(244,168,50,0.15)';
+  ctx.beginPath();
+  ctx.roundRect(px, py, pw, 44, [12, 12, 0, 0]);
+  ctx.fill();
+
+  ctx.font = 'bold 15px monospace';
+  ctx.fillStyle = '#f4a832';
+  ctx.textAlign = 'center';
+  ctx.fillText(`${page.icon}  ${page.title}`, W / 2, py + 28);
+
+  // Page dots
+  for (let i = 0; i < total; i++) {
+    ctx.beginPath();
+    ctx.arc(W / 2 - (total - 1) * 8 + i * 16, py + ph - 18, 4, 0, Math.PI * 2);
+    ctx.fillStyle = i === g.tutorialPage ? '#f4a832' : 'rgba(244,168,50,0.3)';
+    ctx.fill();
+  }
+
+  // Content
+  if (g.tutorialPage === 0) {
+    // Mission briefing text
+    ctx.font = '13px monospace';
+    ctx.textAlign = 'center';
+    page.lines.forEach((line, i) => {
+      ctx.fillStyle = line === '' ? '#333' : (i < 2 ? '#f0e0a0' : '#c8b080');
+      ctx.fillText(line, W / 2, py + 78 + i * 22);
+    });
+
+  } else if (g.tutorialPage === 1) {
+    // Controls page
+    const controls = [
+      { keys: '← → / A D',     action: 'Move rover left / right' },
+      { keys: '↑ / W / Space', action: 'Jump  (low gravity — float!)' },
+      { keys: 'Z / X / ↓',     action: 'Mine resource  (hold near deposit)' },
+      { keys: 'Walk to BASE',   action: 'Deposit cargo at the base camp' },
+      { keys: 'R',              action: 'Restart (after winning)' },
+    ];
+    const colX = px + 30, colW = pw - 60;
+    ctx.textAlign = 'left';
+    controls.forEach((c, i) => {
+      const ry = py + 80 + i * 58;
+      // Key badge
+      ctx.fillStyle = 'rgba(244,168,50,0.12)';
+      ctx.beginPath();
+      ctx.roundRect(colX, ry, colW, 44, 6);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(244,168,50,0.35)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      ctx.font = 'bold 12px monospace';
+      ctx.fillStyle = '#f4a832';
+      ctx.fillText(c.keys, colX + 14, ry + 17);
+      ctx.font = '11px monospace';
+      ctx.fillStyle = '#c0a870';
+      ctx.fillText(c.action, colX + 14, ry + 34);
+    });
+
+  } else if (g.tutorialPage === 2) {
+    // Resources page
+    const resInfo = [
+      { type: 'methane', fact: 'Pools of liquid hydrocarbon — most abundant' },
+      { type: 'ethane',  fact: 'Liquid seas like Kraken Mare near the poles' },
+      { type: 'ice',     fact: 'Water-ice crust & subsurface ocean' },
+      { type: 'ammonia', fact: 'Rare volcanic vents — needed in Phase 3' },
+    ];
+    ctx.textAlign = 'left';
+    resInfo.forEach((r, i) => {
+      const ry = py + 76 + i * 72;
+      const col = RES[r.type].color;
+
+      // Colored side bar
+      ctx.fillStyle = col;
+      ctx.fillRect(px + 30, ry, 4, 54);
+
+      // Resource swatch
+      ctx.fillStyle = col;
+      ctx.globalAlpha = 0.2;
+      ctx.beginPath();
+      ctx.roundRect(px + 42, ry, pw - 72, 54, 6);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      ctx.font = `bold 13px monospace`;
+      ctx.fillStyle = col;
+      ctx.fillText(`${RES[r.type].label}  ${RES[r.type].name}`, px + 56, ry + 20);
+      ctx.font = '11px monospace';
+      ctx.fillStyle = '#a09070';
+      ctx.fillText(r.fact, px + 56, ry + 38);
+    });
+  }
+
+  // Next / Start prompt
+  const isLast = g.tutorialPage === total - 1;
+  const promptText = isLast ? 'SPACE / ENTER  →  START MINING' : 'SPACE / ENTER  →  NEXT';
+  ctx.font = 'bold 11px monospace';
+  ctx.fillStyle = isLast ? '#69f0ae' : '#f4a832';
+  ctx.textAlign = 'center';
+  // pulsing
+  ctx.globalAlpha = 0.7 + 0.3 * Math.sin(g.t * 0.08);
+  ctx.fillText(promptText, W / 2, py + ph - 34);
+  ctx.globalAlpha = 1;
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function rand(n) { return Math.floor(Math.random() * n); }
+function cargoSum(c) { return c.methane + c.ethane + c.ice + c.ammonia; }
+
+// ─── Loop ─────────────────────────────────────────────────────────────────────
+game = makeGame();
+
+function loop() {
+  // Drain key queue for one-shot events
+  while (keyQueue.length > 0) {
+    const code = keyQueue.shift();
+    if (game.state === 'tutorial') {
+      if (code === 'Space' || code === 'Enter' || code === 'KeyZ' || code === 'KeyX') {
+        if (game.tutorialPage < TUTORIAL_PAGES.length - 1) {
+          game.tutorialPage++;
+        } else {
+          game.state = 'playing';
+        }
+      }
+    }
+    if (code === 'KeyR' && (game.state === 'win' || game.state === 'dead')) {
+      game = makeGame();
+    }
+  }
+
+  if (game.state === 'playing') update(game);
+  else game.t++; // keep t ticking for animations during tutorial/win
+
+  draw(game);
+  requestAnimationFrame(loop);
+}
+
+loop();
+</script>
+</body>
+</html>
