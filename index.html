@@ -300,7 +300,7 @@ function spawnAstronauts(terrain, pits = []) {
     let x = 700 + i * 750 + rand(400);
     if (isNearPit(x, pits, 120)) x += 200;
     const gy = groundAt(terrain, x);
-    const maxOxy = 3000 + Math.floor(Math.random() * 1800); // 50–80 s at 60fps
+    const maxOxy = 6000 + Math.floor(Math.random() * 3600); // 100–160 s at 60fps
     out.push({
       x, y: gy,
       vx: (Math.random() < 0.5 ? 1 : -1) * (0.3 + Math.random() * 0.25),
