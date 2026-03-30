@@ -300,7 +300,7 @@ function spawnAstronauts(terrain, pits = []) {
     let x = 700 + i * 750 + rand(400);
     if (isNearPit(x, pits, 120)) x += 200;
     const gy = groundAt(terrain, x);
-    const maxOxy = 6000 + Math.floor(Math.random() * 3600); // 100–160 s at 60fps
+    const maxOxy = 7200 + Math.floor(Math.random() * 3600); // 120–180 s (2–3 min) at 60fps
     out.push({
       x, y: gy,
       vx: (Math.random() < 0.5 ? 1 : -1) * (0.3 + Math.random() * 0.25),
@@ -1587,6 +1587,72 @@ function drawHUD(g) {
     ctx.fillStyle = '#ff7043';
     ctx.fillText('×2 storm', cpx + 155, hullRowY);
   }
+
+  // ── Crew O₂ status panel — below cargo ──
+  const crewPanH = 22 + g.astronauts.length * 16 + 8;
+  const crewPanY = cpy + cpanH + 8;
+  panel(cpx, crewPanY, 210, crewPanH);
+
+  ctx.font = 'bold 10px monospace';
+  ctx.fillStyle = '#80cbc4';
+  ctx.textAlign = 'left';
+  ctx.fillText('Crew O₂', cpx + 10, crewPanY + 15);
+
+  g.astronauts.forEach((a, i) => {
+    const ry = crewPanY + 22 + i * 16 + 11;
+    const label = `C${i + 1}`;
+
+    // Status dot
+    let dotCol, statusText = null, showBar = false;
+    if (a.rescued) {
+      dotCol = '#69f0ae';
+      statusText = '✓ safe';
+    } else if (a.dead) {
+      dotCol = '#ef5350';
+      statusText = '✗ lost';
+    } else if (a.carried) {
+      dotCol = '#4dd0e1';
+      statusText = 'aboard';
+    } else {
+      const r = a.oxygen / a.maxOxygen;
+      dotCol = r > 0.5 ? '#4caf50' : r > 0.25 ? '#ff9800' : '#f44336';
+      showBar = true;
+    }
+
+    // Dot
+    ctx.fillStyle = dotCol;
+    ctx.beginPath();
+    ctx.arc(cpx + 14, ry - 3, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Label
+    ctx.font = '9px monospace';
+    ctx.fillStyle = dotCol;
+    ctx.textAlign = 'left';
+    ctx.fillText(label, cpx + 22, ry);
+
+    if (statusText) {
+      ctx.fillStyle = dotCol;
+      ctx.globalAlpha = 0.85;
+      ctx.fillText(statusText, cpx + 44, ry);
+      ctx.globalAlpha = 1;
+    } else if (showBar) {
+      const r = a.oxygen / a.maxOxygen;
+      const flashA = r < 0.25 ? (0.6 + 0.4 * Math.sin(g.t * 0.35)) : 1;
+      const BAR_W = 110;
+      ctx.globalAlpha = 0.4;
+      ctx.fillStyle = '#333';
+      ctx.fillRect(cpx + 44, ry - 8, BAR_W, 5);
+      ctx.globalAlpha = flashA;
+      ctx.fillStyle = dotCol;
+      ctx.fillRect(cpx + 44, ry - 8, BAR_W * r, 5);
+      ctx.globalAlpha = 1;
+      ctx.font = '8px monospace';
+      ctx.fillStyle = dotCol;
+      ctx.textAlign = 'right';
+      ctx.fillText(`${Math.ceil(r * 100)}%`, cpx + 44 + BAR_W + 16, ry);
+    }
+  });
 
   // ── Hints panel — top-right ──
   const hpx = W - 320, hpy = 10, hpw = 310, hph = 138;
