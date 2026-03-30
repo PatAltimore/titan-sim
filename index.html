@@ -23,11 +23,62 @@
     margin-bottom: 10px;
     text-transform: uppercase;
   }
+  .game-wrap {
+    position: relative;
+    display: inline-block;
+    max-width: 100%;
+  }
   #gameCanvas {
     border: 2px solid #4a2800;
     display: block;
+    max-width: 100%;
+    height: auto;
+    touch-action: none;
     cursor: none;
   }
+  #touch-controls {
+    display: none;
+    position: absolute;
+    bottom: 8px;
+    left: 0;
+    right: 0;
+    padding: 0 14px;
+    justify-content: space-between;
+    align-items: flex-end;
+    pointer-events: none;
+  }
+  .tc-left { display: flex; gap: 10px; pointer-events: none; }
+  .tc-right { display: flex; gap: 10px; pointer-events: none; }
+  .touch-btn {
+    pointer-events: all;
+    background: rgba(244,168,50,0.15);
+    border: 2px solid rgba(244,168,50,0.4);
+    color: rgba(244,168,50,0.95);
+    font-size: 24px;
+    width: 70px; height: 70px;
+    border-radius: 50%;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    touch-action: manipulation;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .touch-btn:active { background: rgba(244,168,50,0.38); }
+  #btn-jump {
+    background: rgba(80,160,255,0.15);
+    border-color: rgba(80,160,255,0.4);
+    color: rgba(130,200,255,0.95);
+  }
+  #btn-jump:active { background: rgba(80,160,255,0.38); }
+  #btn-mine {
+    background: rgba(180,120,40,0.15);
+    border-color: rgba(180,120,40,0.4);
+    color: rgba(220,160,80,0.95);
+    font-size: 20px;
+  }
+  #btn-mine:active { background: rgba(180,120,40,0.38); }
   p.sub {
     margin-top: 8px;
     font-size: 10px;
@@ -38,7 +89,19 @@
 </head>
 <body>
 <h1>Titan Mining Simulator</h1>
+<div class="game-wrap">
 <canvas id="gameCanvas" width="900" height="520"></canvas>
+<div id="touch-controls">
+  <div class="tc-left">
+    <button class="touch-btn" id="btn-left">◀</button>
+    <button class="touch-btn" id="btn-right">▶</button>
+  </div>
+  <div class="tc-right">
+    <button class="touch-btn" id="btn-mine">⛏</button>
+    <button class="touch-btn" id="btn-jump">▲</button>
+  </div>
+</div>
+</div>
 <p class="sub">Saturn's moon Titan — atmosphere 1.48× Earth pressure · gravity 0.14g · hydrocarbon seas · -179°C</p>
 
 <script>
@@ -86,11 +149,12 @@ const ctx = canvas.getContext('2d');
 let game = {};
 
 function makeGame() {
-  const terrain = buildTerrain();
-  const resources = spawnResources(terrain);
-  const hazards = spawnHazards(terrain);
-  const shelters = spawnShelters(terrain);
-  const astronauts = spawnAstronauts(terrain);
+  const pits = buildPits();
+  const terrain = buildTerrain(pits);
+  const resources = spawnResources(terrain, pits);
+  const hazards = spawnHazards(terrain, pits);
+  const shelters = spawnShelters(terrain, pits);
+  const astronauts = spawnAstronauts(terrain, pits);
   return {
     phase: 1,
     state: 'tutorial',  // tutorial | playing | dead | win
@@ -98,11 +162,13 @@ function makeGame() {
     cam: { x: 0 },
     depot: { methane: 0, ethane: 0, ice: 0, ammonia: 0 },
     terrain,
+    pits,
     resources,
     hazards,
     shelters,
     astronauts,
     rescued: 0,
+    pitDeath: false,
     storm: { active: false, warning: false, timer: 0, next: 500 + rand(300) },
     rain: [],
     particles: [],
@@ -132,16 +198,32 @@ function makePlayer() {
   };
 }
 
+// ─── Pits ─────────────────────────────────────────────────────────────────────
+function buildPits() {
+  return [1700, 2850, 3750, 4700].map(base => ({
+    x: base + rand(180) - 90,
+    w: 85 + rand(55),
+  }));
+}
+function isNearPit(x, pits, margin = 80) {
+  return pits.some(p => x > p.x - margin && x < p.x + p.w + margin);
+}
+
 // ─── Terrain ──────────────────────────────────────────────────────────────────
-function buildTerrain() {
+function buildTerrain(pits = []) {
   const pts = [];
   let y = 370;
   for (let x = 0; x <= WORLD_W; x += 50) {
     if (x < 500) {
       y = 370; // flat near base
     } else {
-      y += (Math.random() - 0.49) * 22;
-      y = clamp(y, 270, 410);
+      const inVoid = pits.some(p => x > p.x + 30 && x < p.x + p.w - 30);
+      if (inVoid) {
+        y = 700; // deep below screen — deadly crevasse
+      } else {
+        y += (Math.random() - 0.49) * 22;
+        y = clamp(y, 270, 410);
+      }
     }
     pts.push({ x, y });
   }
@@ -160,7 +242,7 @@ function groundAt(terrain, x) {
 }
 
 // ─── Resources ────────────────────────────────────────────────────────────────
-function spawnResources(terrain) {
+function spawnResources(terrain, pits = []) {
   const out = [];
   const typePool = [
     'methane','methane','methane','methane',
@@ -169,7 +251,10 @@ function spawnResources(terrain) {
     'ammonia',
   ];
   for (let i = 0; i < 70; i++) {
-    const x = 600 + Math.random() * (WORLD_W - 900);
+    let x, tries = 0;
+    do { x = 600 + Math.random() * (WORLD_W - 900); tries++; }
+    while (isNearPit(x, pits, 70) && tries < 15);
+    if (isNearPit(x, pits, 70)) continue;
     const type = typePool[Math.floor(Math.random() * typePool.length)];
     const max = type === 'ammonia' ? 8 + rand(12)
               : type === 'ice'     ? 12 + rand(18)
@@ -185,11 +270,12 @@ function spawnResources(terrain) {
 }
 
 // ─── Hazards ──────────────────────────────────────────────────────────────────
-function spawnHazards(terrain) {
+function spawnHazards(terrain, pits = []) {
   const out = [];
   let lastX = 650;
   while (lastX < WORLD_W - 300) {
     lastX += 160 + rand(240);
+    if (isNearPit(lastX, pits, 70)) continue;
     const type = ['boulder','boulder','spike','spike','vent'][rand(5)];
     const gy = groundAt(terrain, lastX);
     const w = type === 'boulder' ? 24 + rand(22)
@@ -208,11 +294,13 @@ function spawnHazards(terrain) {
 }
 
 // ─── Astronauts ───────────────────────────────────────────────────────────────
-function spawnAstronauts(terrain) {
+function spawnAstronauts(terrain, pits = []) {
   const out = [];
   for (let i = 0; i < 6; i++) {
-    const x = 700 + i * 750 + rand(400);
+    let x = 700 + i * 750 + rand(400);
+    if (isNearPit(x, pits, 120)) x += 200;
     const gy = groundAt(terrain, x);
+    const maxOxy = 3000 + Math.floor(Math.random() * 1800); // 50–80 s at 60fps
     out.push({
       x, y: gy,
       vx: (Math.random() < 0.5 ? 1 : -1) * (0.3 + Math.random() * 0.25),
@@ -220,17 +308,21 @@ function spawnAstronauts(terrain) {
       wanderTimer: rand(180) + 60,
       carried: false,
       rescued: false,
+      dead: false,
+      oxygen: maxOxy,
+      maxOxygen: maxOxy,
     });
   }
   return out;
 }
 
 // ─── Shelters ─────────────────────────────────────────────────────────────────
-function spawnShelters(terrain) {
+function spawnShelters(terrain, pits = []) {
   const out = [];
   let x = 900;
   while (x < WORLD_W - 500) {
     x += 450 + rand(350);
+    if (isNearPit(x + 45, pits, 110)) continue;
     const gy = groundAt(terrain, x + 45);
     out.push({ x, y: gy, w: 92, h: 58 });
   }
@@ -357,6 +449,12 @@ function update(g) {
     p.onGround = false;
   }
 
+  // pit death — fell below screen
+  if (p.y > H + 40) {
+    g.pitDeath = true;
+    g.state = 'dead';
+  }
+
   // ── Camera ──
   g.cam.x = clamp(p.x - W / 2, 0, WORLD_W - W);
 
@@ -445,6 +543,12 @@ function update(g) {
   g.astronauts.forEach(a => {
     if (a.rescued || a.carried) return;
 
+    // Oxygen countdown (pause when dead)
+    if (!a.dead) {
+      a.oxygen = Math.max(0, a.oxygen - 1);
+      if (a.oxygen <= 0) { a.dead = true; return; }
+    } else { return; }
+
     // Wander
     a.wanderTimer--;
     if (a.wanderTimer <= 0) {
@@ -455,7 +559,7 @@ function update(g) {
     a.x = clamp(a.x + a.vx, 200, WORLD_W - 100);
     a.y = groundAt(g.terrain, a.x);
 
-    // Pick up when rover touches astronaut
+    // Pick up when rover touches astronaut (not dead)
     const dx = (a.x) - (p.x + p.w / 2);
     const dy = (a.y - 20) - (p.y + p.h / 2);
     if (Math.sqrt(dx * dx + dy * dy) < 30 && !p.carriedAstronaut) {
@@ -609,6 +713,9 @@ function draw(g) {
     ctx.fill();
   });
 
+  // ── Crevasse voids (drawn before terrain so terrain clips over edges) ──
+  drawPits(g);
+
   // ── Terrain ──
   const ter = g.terrain;
   ctx.beginPath();
@@ -726,23 +833,28 @@ function draw(g) {
       ctx.fillStyle = 'rgba(255,255,255,0.45)';
       ctx.fill();
     } else if (r.type === 'ice') {
-      // crystals
-      ctx.fillStyle = col;
-      ctx.globalAlpha = 0.85;
-      const crystalH = [10, 16, 12];
-      for (let i = 0; i < 3; i++) {
-        const cx = rx + (i - 1) * 11;
-        const ch = crystalH[i] * ratio;
+      // Water droplets
+      ctx.globalAlpha = 0.9;
+      const drops = [{ dx: -11, s: 0.8 }, { dx: 0, s: 1.0 }, { dx: 11, s: 0.8 }];
+      drops.forEach(({ dx, s }) => {
+        const bx = rx + dx;
+        const by = ry + 3;
+        const cr = 5.5 * s * ratio;   // circle radius (bottom of drop)
+        const tipY = by - cr * 2.8;   // pointed tip (top)
+        ctx.fillStyle = col;
         ctx.beginPath();
-        ctx.moveTo(cx, ry - ch);
-        ctx.lineTo(cx - 5, ry + 2);
-        ctx.lineTo(cx + 5, ry + 2);
+        ctx.moveTo(bx, tipY);
+        ctx.quadraticCurveTo(bx + cr * 1.25, by - cr * 1.4, bx + cr, by - cr);
+        ctx.arc(bx, by - cr, cr, 0, Math.PI);   // round bottom
+        ctx.quadraticCurveTo(bx - cr * 1.25, by - cr * 1.4, bx, tipY);
         ctx.closePath();
         ctx.fill();
-        ctx.strokeStyle = 'rgba(255,255,255,0.55)';
-        ctx.lineWidth = 1;
-        ctx.stroke();
-      }
+        // Inner highlight
+        ctx.fillStyle = 'rgba(255,255,255,0.42)';
+        ctx.beginPath();
+        ctx.ellipse(bx - cr * 0.32, tipY + (by - tipY) * 0.28, cr * 0.28, cr * 0.42, -0.25, 0, Math.PI * 2);
+        ctx.fill();
+      });
     } else if (r.type === 'ammonia') {
       // vent crack
       ctx.fillStyle = '#5d3060';
@@ -853,16 +965,27 @@ function draw(g) {
     ctx.textAlign = 'center';
     ctx.font = 'bold 30px monospace';
     ctx.fillStyle = '#ff5252';
-    ctx.fillText('ROVER DESTROYED', W / 2, H / 2 - 50);
-    ctx.font = '14px monospace';
-    ctx.fillStyle = '#ef9a9a';
-    ctx.fillText('Hull integrity reached 0% — too much damage.', W / 2, H / 2 - 10);
-    ctx.fillStyle = '#b0bec5';
-    ctx.font = '12px monospace';
-    ctx.fillText('Tip: jump over boulders & ice spikes.', W / 2, H / 2 + 18);
-    ctx.fillText('Avoid cryo-vent gas plumes.', W / 2, H / 2 + 36);
-    ctx.fillText('Return to BASE to repair hull.', W / 2, H / 2 + 54);
-    ctx.fillText('During methane storms, hazards deal 2× damage.', W / 2, H / 2 + 72);
+    if (g.pitDeath) {
+      ctx.fillText('ROVER LOST IN CREVASSE', W / 2, H / 2 - 50);
+      ctx.font = '14px monospace';
+      ctx.fillStyle = '#ef9a9a';
+      ctx.fillText('The rover plunged into a methane crevasse — total loss.', W / 2, H / 2 - 10);
+      ctx.fillStyle = '#b0bec5';
+      ctx.font = '12px monospace';
+      ctx.fillText('Watch for dark gaps in the terrain — deadly drop.', W / 2, H / 2 + 18);
+      ctx.fillText('Jump over crevasses or find a path around them.', W / 2, H / 2 + 36);
+    } else {
+      ctx.fillText('ROVER DESTROYED', W / 2, H / 2 - 50);
+      ctx.font = '14px monospace';
+      ctx.fillStyle = '#ef9a9a';
+      ctx.fillText('Hull integrity reached 0% — too much damage.', W / 2, H / 2 - 10);
+      ctx.fillStyle = '#b0bec5';
+      ctx.font = '12px monospace';
+      ctx.fillText('Tip: jump over boulders & ice spikes.', W / 2, H / 2 + 18);
+      ctx.fillText('Avoid cryo-vent gas plumes.', W / 2, H / 2 + 36);
+      ctx.fillText('Return to BASE to repair hull.', W / 2, H / 2 + 54);
+      ctx.fillText('During methane storms, hazards deal 2× damage.', W / 2, H / 2 + 72);
+    }
     ctx.font = 'bold 13px monospace';
     ctx.fillStyle = '#f4a832';
     ctx.fillText('Press R to try again', W / 2, H / 2 + 105);
@@ -897,43 +1020,43 @@ function draw(g) {
   }
 }
 
-function drawAstronaut(ctx, x, y, facing, carried, t) {
+function drawAstronaut(ctx, x, y, facing, carried, t, dead = false) {
   ctx.save();
   ctx.translate(x, y);
   if (facing < 0) ctx.scale(-1, 1);
 
-  // Legs (walking bob)
-  const bob = carried ? 0 : Math.sin(t * 0.18) * 3;
-  ctx.fillStyle = '#90a4ae';
-  ctx.fillRect(-4, -10 + bob, 3, 10);   // left leg
-  ctx.fillRect(2,  -10 - bob, 3, 10);   // right leg (opposite phase)
+  // Legs (walking bob — frozen when dead or carried)
+  const bob = (carried || dead) ? 0 : Math.sin(t * 0.18) * 3;
+  ctx.fillStyle = dead ? '#455a64' : '#90a4ae';
+  ctx.fillRect(-4, -10 + bob, 3, 10);
+  ctx.fillRect(2,  -10 - bob, 3, 10);
 
   // Body / suit
-  ctx.fillStyle = '#eceff1';
+  ctx.fillStyle = dead ? '#78909c' : '#eceff1';
   ctx.beginPath();
   ctx.roundRect(-6, -22, 12, 13, 2);
   ctx.fill();
 
   // Visor helmet
-  ctx.fillStyle = '#78909c';
+  ctx.fillStyle = dead ? '#546e7a' : '#78909c';
   ctx.beginPath();
   ctx.arc(0, -27, 8, 0, Math.PI * 2);
   ctx.fill();
-  ctx.fillStyle = '#4dd0e1';
+  ctx.fillStyle = dead ? '#263238' : '#4dd0e1';
   ctx.beginPath();
   ctx.arc(0, -27, 5, 0, Math.PI * 2);
   ctx.fill();
-  ctx.fillStyle = 'rgba(255,255,255,0.3)';
+  ctx.fillStyle = dead ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.3)';
   ctx.beginPath();
   ctx.arc(-2, -29, 2, 0, Math.PI * 2);
   ctx.fill();
 
   // Backpack
-  ctx.fillStyle = '#607d8b';
+  ctx.fillStyle = dead ? '#37474f' : '#607d8b';
   ctx.fillRect(5, -21, 5, 9);
 
-  // Distress beacon (blinking) — not when carried
-  if (!carried) {
+  // Distress beacon (blinking) — only when alive and not carried
+  if (!carried && !dead) {
     const blink = Math.floor(t / 15) % 2 === 0;
     ctx.fillStyle = blink ? '#ff1744' : '#880000';
     ctx.beginPath();
@@ -951,12 +1074,47 @@ function drawAstronauts(g) {
     if (a.carried) return; // drawn on rover instead
     const ax = a.x - cam;
     if (ax < -40 || ax > W + 40) return;
+
+    if (a.dead) {
+      // Greyed-out slumped astronaut
+      ctx.globalAlpha = 0.45;
+      drawAstronaut(ctx, ax, a.y - 2, a.facing, false, 0, true);
+      ctx.globalAlpha = 1;
+      ctx.font = 'bold 10px monospace';
+      ctx.fillStyle = '#ef9a9a';
+      ctx.textAlign = 'center';
+      ctx.fillText('✕', ax, a.y - 48);
+      return;
+    }
+
     drawAstronaut(ctx, ax, a.y - 2, a.facing, false, g.t);
 
-    // "!" callout above
-    const pulseA = 0.6 + 0.4 * Math.sin(g.t * 0.1);
-    ctx.font = 'bold 11px monospace';
-    ctx.fillStyle = `rgba(255,235,59,${pulseA})`;
+    // O₂ bar
+    const BAR_W = 30;
+    const oxyRatio = a.oxygen / a.maxOxygen;
+    const bx = ax - BAR_W / 2;
+    const barY = a.y - 57;
+    const barColor = oxyRatio > 0.5 ? '#4caf50' : oxyRatio > 0.25 ? '#ff9800' : '#f44336';
+    const flashAlpha = oxyRatio < 0.25 ? (0.55 + 0.45 * Math.sin(g.t * 0.35)) : 0.88;
+    ctx.globalAlpha = 0.75;
+    ctx.fillStyle = '#0d1117';
+    ctx.fillRect(bx - 1, barY - 1, BAR_W + 2, 6);
+    ctx.globalAlpha = flashAlpha;
+    ctx.fillStyle = barColor;
+    ctx.fillRect(bx, barY, Math.max(0, BAR_W * oxyRatio), 4);
+    ctx.globalAlpha = 1;
+    ctx.font = '7px monospace';
+    ctx.fillStyle = barColor;
+    ctx.textAlign = 'right';
+    ctx.fillText('O₂', bx - 2, barY + 4);
+
+    // "!" callout — more urgent when O₂ is critical
+    const isCritical = oxyRatio < 0.25;
+    const pulseA = isCritical
+      ? (0.6 + 0.4 * Math.sin(g.t * 0.35))
+      : (0.6 + 0.4 * Math.sin(g.t * 0.1));
+    ctx.font = isCritical ? 'bold 13px monospace' : 'bold 11px monospace';
+    ctx.fillStyle = isCritical ? `rgba(255,82,82,${pulseA})` : `rgba(255,235,59,${pulseA})`;
     ctx.textAlign = 'center';
     ctx.fillText('!', ax, a.y - 44);
   });
@@ -967,6 +1125,56 @@ function drawAstronauts(g) {
     const py = g.player.y - 28;
     drawAstronaut(ctx, px, py, g.player.facing, true, g.t);
   }
+}
+
+function drawPits(g) {
+  const cam = g.cam.x;
+  g.pits.forEach(pit => {
+    const px = pit.x - cam;
+    if (px + pit.w < -20 || px > W + 20) return;
+
+    // Deep void background
+    const vg = ctx.createLinearGradient(0, 240, 0, H);
+    vg.addColorStop(0, '#080300');
+    vg.addColorStop(1, '#0d0600');
+    ctx.fillStyle = vg;
+    ctx.fillRect(px, 0, pit.w, H);
+
+    // Depth lines in void
+    ctx.lineWidth = 1;
+    [0.3, 0.55, 0.78].forEach((f, i) => {
+      ctx.strokeStyle = `rgba(80,35,0,${0.1 + i * 0.05})`;
+      ctx.beginPath();
+      ctx.moveTo(px + pit.w * f, 0);
+      ctx.lineTo(px + pit.w * f, H);
+      ctx.stroke();
+    });
+
+    // Left edge danger glow
+    const lg = ctx.createLinearGradient(px, 0, px + 20, 0);
+    lg.addColorStop(0, 'rgba(255,70,0,0.55)');
+    lg.addColorStop(1, 'rgba(255,70,0,0)');
+    ctx.fillStyle = lg;
+    ctx.fillRect(px, 0, 20, H);
+
+    // Right edge danger glow
+    const rg = ctx.createLinearGradient(px + pit.w - 20, 0, px + pit.w, 0);
+    rg.addColorStop(0, 'rgba(255,70,0,0)');
+    rg.addColorStop(1, 'rgba(255,70,0,0.55)');
+    ctx.fillStyle = rg;
+    ctx.fillRect(px + pit.w - 20, 0, 20, H);
+
+    // "CREVASSE" label in the void
+    ctx.save();
+    ctx.globalAlpha = 0.22;
+    ctx.font = 'bold 11px monospace';
+    ctx.fillStyle = '#ff6030';
+    ctx.textAlign = 'center';
+    ctx.fillText('CREVASSE', px + pit.w / 2, H / 2 - 10);
+    ctx.font = '18px monospace';
+    ctx.fillText('⚠', px + pit.w / 2, H / 2 + 14);
+    ctx.restore();
+  });
 }
 
 function drawShelters(g) {
@@ -1348,7 +1556,8 @@ function drawHUD(g) {
   // Rescued astronauts row
   const rescueRowY = cpy + 44 + Math.max(cargoRows.length, 1) * 22;
   const totalAstronauts = g.astronauts.length;
-  const rescueCol = g.rescued === totalAstronauts ? '#69f0ae' : '#80cbc4';
+  const deadCount = g.astronauts.filter(a => a.dead).length;
+  const rescueCol = g.rescued === totalAstronauts ? '#69f0ae' : deadCount > 0 ? '#ef9a9a' : '#80cbc4';
   ctx.font = '10px monospace';
   ctx.fillStyle = rescueCol;
   ctx.textAlign = 'left';
@@ -1359,6 +1568,10 @@ function drawHUD(g) {
     ctx.font = '8px monospace';
     ctx.fillStyle = '#80cbc4';
     ctx.fillText('carrying!', cpx + 155, rescueRowY);
+  } else if (deadCount > 0) {
+    ctx.font = '8px monospace';
+    ctx.fillStyle = '#ef9a9a';
+    ctx.fillText(`${deadCount} lost`, cpx + 155, rescueRowY);
   }
 
   // Hull row — same layout as cargo rows
@@ -1694,6 +1907,42 @@ function loop() {
 }
 
 loop();
+
+// ─── Touch controls ───────────────────────────────────────────────────────────
+function bindTouchBtn(id, code) {
+  const btn = document.getElementById(id);
+  if (!btn) return;
+  const on  = e => { e.preventDefault(); keys[code] = true;  keyQueue.push(code); };
+  const off = e => { e.preventDefault(); keys[code] = false; };
+  btn.addEventListener('touchstart',  on,  { passive: false });
+  btn.addEventListener('touchend',    off, { passive: false });
+  btn.addEventListener('touchcancel', off, { passive: false });
+}
+bindTouchBtn('btn-left',  'ArrowLeft');
+bindTouchBtn('btn-right', 'ArrowRight');
+bindTouchBtn('btn-jump',  'ArrowUp');
+bindTouchBtn('btn-mine',  'KeyZ');
+
+// Show touch overlay on first touch
+window.addEventListener('touchstart', () => {
+  const tc = document.getElementById('touch-controls');
+  if (tc) tc.style.display = 'flex';
+}, { once: true, passive: true });
+
+// Tap canvas to advance tutorial or restart
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  if (game.state === 'tutorial') {
+    if (game.tutorialPage < TUTORIAL_PAGES.length - 1) {
+      game.tutorialPage++;
+    } else {
+      game.state = 'playing';
+    }
+  } else if (game.state === 'win' || game.state === 'dead') {
+    game = makeGame();
+    game.state = 'playing';
+  }
+}, { passive: false });
 </script>
 </body>
 </html>
