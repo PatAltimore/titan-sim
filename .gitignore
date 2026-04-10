@@ -16,6 +16,8 @@ Thumbs.db
 # Editor
 .vscode/
 .idea/
+# Local AI agent configuration
+.claude/
 *.suo
 *.user
 
